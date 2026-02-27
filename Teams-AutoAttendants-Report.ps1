@@ -1,46 +1,53 @@
 <#
 .SYNOPSIS
-Generates an HTML documentation report for all Microsoft Teams Auto Attendants in the tenant.
+Generates an HTML documentation report for all Microsoft Teams Auto Attendants.
 
 .DESCRIPTION
-This script enumerates all Auto Attendants (AAs) and produces a formatted HTML report that documents:
- - General AA settings (name, ID, time zone, language, voice input, operator).
- - Business hours schedule text.
- - Business hours call handling classified as Menu / Disconnect / Redirect using the 'Automatic' rule:
-     * If there is one MenuOption with DtmfResponse = 'Automatic' and Action = DisconnectCall -> Disconnect
-     * If there is one MenuOption with DtmfResponse = 'Automatic' and Action = TransferCallToTarget -> Redirect (shows friendly target)
-     * If there are keypad options (Tone1..9, Star, Pound) -> Menu
- - Default menu greeting (from DefaultCallFlow.Menu.Prompts) shown as:
-     * "Greeting: TTS: <text>" OR "Greeting: AudioFile" OR "Greeting: None"
- - Default call flow options (DTMF + Action + Target) for all keys 0–9/*/# (no per-option greeting).
- - After-hours call handling classified with the same logic (Menu / Disconnect / Redirect).
- - Holidays (date ranges, greeting, action, target).
- - Resource accounts and numbers bound to the AA.
- - Authorized users.
+This read-only script enumerates all Auto Attendants (AAs) and produces a structured HTML report.
+It resolves friendly names for targets and agents, and includes bracketed audit details such as
+raw IDs and Resource Account attachments.
 
-Targets are resolved into friendly names with audit-friendly brackets:
- - Call Queue / Auto Attendant / Group (Shared Voicemail) / User / PSTN / Resource Account (ApplicationEndpoint).
- - Resource Accounts are mapped to the Call Queue / Auto Attendant they’re attached to (when possible) and
-   rendered with "attached to call queue/auto attendant: <Name>" for clarity.
+The report includes:
+ - Identity & basics (Name, Identity, Time zone, Language, Voice input, Voice/TTS voice, Operator)
+ - Business hours (weekly schedule text)
+ - Business hours call handling classified as Menu / Disconnect / Redirect using the 'Automatic' rule:
+     * Single MenuOption with DtmfResponse='Automatic' + Action=DisconnectCall -> Disconnect
+     * Single MenuOption with DtmfResponse='Automatic' + Action=TransferCallToTarget -> Redirect (shows target)
+     * Any keypad options (Tone1..9, Star, Pound) -> Menu
+ - Default menu greeting (from DefaultCallFlow.Menu.Prompts):
+     * "Greeting: TTS: <text>" OR "Greeting: AudioFile" OR "Greeting: None"
+ - Default call flow options (DTMF + Action + Target) for all keys 0–9/*/# (no per-option greeting)
+ - After-hours call handling classified with the same logic (Menu / Disconnect / Redirect)
+ - Holidays (date ranges, greeting, action, target)
+ - Resource accounts and numbers bound to the AA
+ - Authorized users (friendly DisplayName)
+
+TARGET RESOLUTION (best effort)
+ - PSTN: strips 'tel:' and displays E.164
+ - Call Queue: CQ name by Id (handles ConfigurationEndpoint)
+ - Auto Attendant: AA name by Id
+ - Resource Account (ApplicationInstance): RA display name and, if mapped, the attached CQ/AA name
+ - Group (Shared Voicemail / Team / Channel): Team/M365 Group display name where possible
+ - User: DisplayName (falls back to UPN/Id)
+ - Otherwise: shows the raw Id as “Unknown”
 
 REQUIREMENTS
- - Teams PowerShell (Teams/Skype for Business Online) module with access to:
+ - Teams/Skype Online PowerShell with access to:
      * Get-CsAutoAttendant
-     * Get-CsCallQueue
-     * Get-CsOnlineApplicationInstance
-     * Get-CsOnlineUser
- - Optional (for better SharedVoicemail group names):
+     * Get-CsCallQueue (for target resolution)
+     * Get-CsOnlineApplicationInstance (resource accounts)
+     * Get-CsOnlineUser (authorized users)
+ - Optional (for richer group names):
      * MicrosoftTeams: Get-Team
      * ExchangeOnlineManagement: Get-UnifiedGroup
      * Microsoft.Graph: Get-MgGroup
-   The script will use these if present, otherwise it gracefully falls back.
 
 .PARAMETER OutputPath
-Full path (or relative path) to the HTML file that will be created.
-Default: ".\Teams-AutoAttendants-Report-<timestamp>.html"
+Full or relative path to the HTML report file.
+Default: .\Teams-AutoAttendants-Report-<timestamp>.html
 
 .PARAMETER Open
-If specified, opens the generated HTML report in the default browser/viewer when complete.
+If specified, opens the generated HTML report when complete.
 
 .PARAMETER IncludeAfterHoursOptions
 (Reserved for future use) Would list after-hours menu options similar to default call flow options.
@@ -48,15 +55,16 @@ Currently unused; included as a placeholder for easy extension.
 
 .EXAMPLE
 PS> .\Export-TeamsAAReport.ps1
-Generates ".\Teams-AutoAttendants-Report-YYYYMMDD-HHmmss.html" and opens it if -Open is specified.
+Generates ".\Teams-AutoAttendants-Report-YYYYMMDD-HHmmss.html".
 
 .EXAMPLE
 PS> .\Export-TeamsAAReport.ps1 -OutputPath "C:\Temp\AA-Report.html" -Open
-Writes the report to C:\Temp\AA-Report.html and opens it.
+Writes the report to C:\Temp\AA-Report.html and opens it in the default browser.
 
 .NOTES
-- If you see parser errors like "variable followed by colon": use ${variable}: inside double-quoted strings.
-- This script is read-only; it does not change any tenant configuration.
+ - Parser-safety: Hashtables use ';' between key/value pairs. Complex values are built in variables first.
+ - Null-safety: All .ContainsKey / indexing operations guard against null/empty keys.
+ - This script is read-only; it does not modify any tenant configuration.
 #>
 
 [CmdletBinding()]
@@ -71,10 +79,6 @@ $ErrorActionPreference = "Stop"
 
 # ----------------------------- Utilities -----------------------------
 function HtmlEncode {
-    <#
-    .SYNOPSIS
-    HTML-encodes a string; null-safe.
-    #>
     param([string]$Text)
     if ($null -eq $Text) { return "" }
     [System.Net.WebUtility]::HtmlEncode($Text)
@@ -92,55 +96,50 @@ $script:_ResolveCache = @{
     IndexBuilt = $false
 }
 
+# --------- Helpers to build a topology index for fast lookups ----------
 function Build-TargetIndex {
-    <#
-    .SYNOPSIS
-    Preloads cross-references to speed up target resolution (CQ/AA and RA mappings).
-    .DESCRIPTION
-    - Loads all Call Queues (names + RA bindings).
-    - Indexes the passed Auto Attendants (names + RA bindings).
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [array]$AllAAs
     )
 
     # Load all Call Queues; map CQ by Id and ResourceAccount -> CQ
-    try {
-        $allCqs = @(Get-CsCallQueue)
-    } catch {
-        $allCqs = @()
-    }
-
+    $allCqs = @()
+    try { $allCqs = @(Get-CsCallQueue) } catch {}
     foreach ($q in $allCqs) {
+        if ($null -eq $q) { continue }
         $qid = [string]$q.Identity
-        $script:_ResolveCache.CQsById[$qid] = $q.Name
+        if (-not [string]::IsNullOrWhiteSpace($qid)) {
+            $script:_ResolveCache.CQsById[$qid] = $q.Name
+        }
         foreach ($raId in @($q.ResourceAccounts)) {
             $rid = [string]$raId
-            $script:_ResolveCache.CQByRA[$rid] = @{ Id = $qid; Name = $q.Name }
+            if (-not [string]::IsNullOrWhiteSpace($rid)) {
+                $script:_ResolveCache.CQByRA[$rid] = @{ Id = $qid; Name = $q.Name }
+            }
         }
     }
 
     # Index the provided AAs (names + RA bindings)
     foreach ($aa in $AllAAs) {
+        if ($null -eq $aa) { continue }
         $aid = [string]$aa.Identity
-        $script:_ResolveCache.AAsById[$aid] = $aa.Name
+        if (-not [string]::IsNullOrWhiteSpace($aid)) {
+            $script:_ResolveCache.AAsById[$aid] = $aa.Name
+        }
         foreach ($raId in @($aa.ApplicationInstances)) {
             $rid = [string]$raId
-            $script:_ResolveCache.AAByRA[$rid] = @{ Id = $aid; Name = $aa.Name }
+            if (-not [string]::IsNullOrWhiteSpace($rid)) {
+                $script:_ResolveCache.AAByRA[$rid] = @{ Id = $aid; Name = $aa.Name }
+            }
         }
     }
 
     $script:_ResolveCache.IndexBuilt = $true
 }
 
+# --------------------- Core extract/normalize/resolve ----------------------
 function Get-IdFromCallTarget {
-    <#
-    .SYNOPSIS
-    Extracts a usable identifier from a CallTarget-like object across schema variations.
-    .OUTPUTS
-    System.String or $null
-    #>
     param($CallTarget)
 
     if (-not $CallTarget) { return $null }
@@ -169,22 +168,18 @@ function Get-IdFromCallTarget {
     foreach ($prop in $CallTarget.PSObject.Properties) {
         $val = [string]$prop.Value
         if (-not [string]::IsNullOrWhiteSpace($val)) {
-            if ($val -match '^[0-9a-fA-F-]{36}$') { return $val }                # GUID
-            if ($val -match '^tel:\+?\d') { return $val }                       # tel:+E164
-            if ($val -match '^\+?\d[\d\s\-()]{6,}$') { return $val }            # phone-ish
+            if ($val -match '^[0-9a-fA-F-]{36}$') { return $val }     # GUID
+            if ($val -match '^tel:\+?\d') { return $val }            # tel:+E164
+            if ($val -match '^\+?\d[\d\s\-()]{6,}$') { return $val } # phone-ish
         }
     }
     return $null
 }
 
 function Normalize-TargetType {
-    <#
-    .SYNOPSIS
-    Normalizes various Teams/AA target 'Type' values into canonical buckets.
-    #>
     param([string]$Type)
     switch -Regex ($Type) {
-        '^ConfigurationEndpoint$' { return 'CallQueue' }   # CQ targets often appear as ConfigurationEndpoint
+        '^ConfigurationEndpoint$' { return 'CallQueue' }
         '^CallQueue$'             { return 'CallQueue' }
         '^Queue$'                 { return 'CallQueue' }
         '^ApplicationEndpoint$'   { return 'ResourceAccount' }
@@ -199,10 +194,6 @@ function Normalize-TargetType {
 }
 
 function Get-HumanTypeLabel {
-    <#
-    .SYNOPSIS
-    Provides a human-friendly label for a normalized target type.
-    #>
     param([string]$NormalizedType)
     switch ($NormalizedType) {
         'CallQueue'       { 'call queue' }
@@ -217,11 +208,10 @@ function Get-HumanTypeLabel {
 
 function Resolve-CallTargetFriendly {
     <#
-    .SYNOPSIS
-    Resolves a CallTarget object to a friendly label and attached mapping (for Resource Accounts).
-    .DESCRIPTION
-    Returns a hashtable with:
-      RawType, Id, NormType, Friendly, AttachedType, AttachedName
+      Returns:
+      @{
+        RawType; Id; NormType; Friendly; AttachedType; AttachedName
+      }
     #>
     param($CallTarget)
 
@@ -234,7 +224,6 @@ function Resolve-CallTargetFriendly {
     function _try { param([scriptblock]$s) try { & $s } catch { $null } }
 
     switch ($type) {
-
         'User' {
             $label = $id
             if ($id) {
@@ -246,9 +235,7 @@ function Resolve-CallTargetFriendly {
             }
             return @{ RawType=$rawType; Id=$id; NormType=$type; Friendly=$label; AttachedType=""; AttachedName="" }
         }
-
         'Group' {
-            # Shared Voicemail is a Group; we try Teams/EXO/Graph for a friendly name.
             $label = $id
             if ($id) {
                 if (-not $script:_ResolveCache.Groups.ContainsKey($id)) {
@@ -272,15 +259,11 @@ function Resolve-CallTargetFriendly {
             }
             return @{ RawType=$rawType; Id=$id; NormType=$type; Friendly=$label; AttachedType=""; AttachedName="" }
         }
-
         'Pstn' {
-            # Strip tel: prefix for display
             $label = if ($id) { ($id -replace '^tel:','') } else { "" }
             return @{ RawType=$rawType; Id=$id; NormType=$type; Friendly=$label; AttachedType=""; AttachedName="" }
         }
-
         'CallQueue' {
-            # The Id may be a CQ Id, a Resource Account Id, or (rarely) an AA Id.
             if ($id) {
                 if ($script:_ResolveCache.CQsById.ContainsKey($id)) {
                     return @{ RawType=$rawType; Id=$id; NormType='CallQueue'; Friendly=$script:_ResolveCache.CQsById[$id]; AttachedType=""; AttachedName="" }
@@ -303,9 +286,9 @@ function Resolve-CallTargetFriendly {
                     return @{ RawType=$rawType; Id=$id; NormType='AutoAttendant'; Friendly=$aaTry.Name; AttachedType=""; AttachedName="" }
                 }
             }
-            return @{ RawType=$rawType; Id=$id; NormType='CallQueue'; Friendly=($id ?? ""); AttachedType=""; AttachedName="" }
+            $friendly = if ($id) { $id } else { "" }
+            return @{ RawType=$rawType; Id=$id; NormType='CallQueue'; Friendly=$friendly; AttachedType=""; AttachedName="" }
         }
-
         'AutoAttendant' {
             $label = $id
             if ($id) {
@@ -317,9 +300,7 @@ function Resolve-CallTargetFriendly {
             }
             return @{ RawType=$rawType; Id=$id; NormType='AutoAttendant'; Friendly=$label; AttachedType=""; AttachedName="" }
         }
-
         'ResourceAccount' {
-            # Resolve RA display and map to CQ/AA if bound. Friendly -> attached entity name where possible.
             $raName = $id
             if ($id -and -not $script:_ResolveCache.RAs.ContainsKey($id)) {
                 $ra = _try { Get-CsOnlineApplicationInstance -Identity $id -ErrorAction Stop }
@@ -338,9 +319,7 @@ function Resolve-CallTargetFriendly {
 
             return @{ RawType=$rawType; Id=$id; NormType='ResourceAccount'; Friendly=$raName; AttachedType=""; AttachedName="" }
         }
-
         default {
-            # Fallback: try RA heuristic; else echo ID
             if ($id -and -not $script:_ResolveCache.RAs.ContainsKey($id)) {
                 $ra = _try { Get-CsOnlineApplicationInstance -Identity $id -ErrorAction Stop }
                 if ($ra) { $script:_ResolveCache.RAs[$id] = $ra.DisplayName }
@@ -351,116 +330,178 @@ function Resolve-CallTargetFriendly {
     }
 }
 
-function Format-TargetBracket {
+# NEW: Fallback resolver when CallTarget.Type-based resolution isn't enough
+function Resolve-AnyIdFriendly {
     <#
-    .SYNOPSIS
-    Renders a muted bracket detail after a friendly target name.
-    .DESCRIPTION
-    (human label; RawType Id; [attached to call queue|auto attendant: Name])
+      .SYNOPSIS
+      Best-effort resolver given only an Id string (CQ -> AA -> RA (+attachment) -> Group -> User -> PSTN).
+      .RETURNS hashtable with keys: RawType, Id, NormType, Friendly, AttachedType, AttachedName
     #>
-    param($Resolved)
+    param([string]$Id)
 
+    function _try { param([scriptblock]$s) try { & $s } catch { $null } }
+
+    if ([string]::IsNullOrWhiteSpace($Id)) {
+        return @{ RawType=""; Id=""; NormType=""; Friendly=""; AttachedType=""; AttachedName="" }
+    }
+
+    # PSTN
+    if ($Id -match '^tel:\+?\d' -or $Id -match '^\+?\d[\d\s\-()]{6,}$') {
+        $num = ($Id -replace '^tel:','')
+        return @{ RawType='PhoneNumber'; Id=$Id; NormType='Pstn'; Friendly=$num; AttachedType=""; AttachedName="" }
+    }
+
+    # CQ
+    if ($script:_ResolveCache.CQsById.ContainsKey($Id)) {
+        return @{ RawType='CallQueue'; Id=$Id; NormType='CallQueue'; Friendly=$script:_ResolveCache.CQsById[$Id]; AttachedType=""; AttachedName="" }
+    }
+    $cq = _try { Get-CsCallQueue -Identity $Id -ErrorAction Stop }
+    if ($cq) {
+        $script:_ResolveCache.CQsById[$Id] = $cq.Name
+        return @{ RawType='CallQueue'; Id=$Id; NormType='CallQueue'; Friendly=$cq.Name; AttachedType=""; AttachedName="" }
+    }
+
+    # AA
+    if ($script:_ResolveCache.AAsById.ContainsKey($Id)) {
+        return @{ RawType='AutoAttendant'; Id=$Id; NormType='AutoAttendant'; Friendly=$script:_ResolveCache.AAsById[$Id]; AttachedType=""; AttachedName="" }
+    }
+    $aa = _try { Get-CsAutoAttendant -Identity $Id -ErrorAction Stop }
+    if ($aa) {
+        $script:_ResolveCache.AAsById[$Id] = $aa.Name
+        return @{ RawType='AutoAttendant'; Id=$Id; NormType='AutoAttendant'; Friendly=$aa.Name; AttachedType=""; AttachedName="" }
+    }
+
+    # RA (and RA -> CQ/AA)
+    if (-not $script:_ResolveCache.RAs.ContainsKey($Id)) {
+        $ra = _try { Get-CsOnlineApplicationInstance -Identity $Id -ErrorAction Stop }
+        if ($ra) { $script:_ResolveCache.RAs[$Id] = $ra.DisplayName }
+    }
+    if ($script:_ResolveCache.RAs.ContainsKey($Id)) {
+        if ($script:_ResolveCache.CQByRA.ContainsKey($Id)) {
+            $name = $script:_ResolveCache.CQByRA[$Id].Name
+            return @{ RawType='ApplicationEndpoint'; Id=$Id; NormType='ResourceAccount'; Friendly=$name; AttachedType='CallQueue'; AttachedName=$name }
+        }
+        if ($script:_ResolveCache.AAByRA.ContainsKey($Id)) {
+            $name = $script:_ResolveCache.AAByRA[$Id].Name
+            return @{ RawType='ApplicationEndpoint'; Id=$Id; NormType='ResourceAccount'; Friendly=$name; AttachedType='AutoAttendant'; AttachedName=$name }
+        }
+        return @{ RawType='ApplicationEndpoint'; Id=$Id; NormType='ResourceAccount'; Friendly=$script:_ResolveCache.RAs[$Id]; AttachedType=""; AttachedName="" }
+    }
+
+    # Group (Team/M365 Group)
+    if (-not $script:_ResolveCache.Groups.ContainsKey($Id)) {
+        $gName = $null
+        if (Get-Command Get-Team -ErrorAction SilentlyContinue) {
+            $t = _try { Get-Team -GroupId $Id }
+            if ($t) { $gName = $t.DisplayName }
+        }
+        if (-not $gName -and (Get-Command Get-UnifiedGroup -ErrorAction SilentlyContinue)) {
+            $g = _try { Get-UnifiedGroup -Identity $Id -ErrorAction Stop }
+            if ($g) { $gName = $g.DisplayName }
+        }
+        if (-not $gName -and (Get-Command Get-MgGroup -ErrorAction SilentlyContinue)) {
+            $g = _try { Get-MgGroup -GroupId $Id -Property DisplayName }
+            if ($g) { $gName = $g.DisplayName }
+        }
+        if ($gName) { $script:_ResolveCache.Groups[$Id] = $gName }
+    }
+    if ($script:_ResolveCache.Groups.ContainsKey($Id)) {
+        return @{ RawType='Group'; Id=$Id; NormType='Group'; Friendly=$script:_ResolveCache.Groups[$Id]; AttachedType=""; AttachedName="" }
+    }
+
+    # User
+    if (-not $script:_ResolveCache.Users.ContainsKey($Id)) {
+        $u = _try { Get-CsOnlineUser -Identity $Id -ErrorAction Stop }
+        if ($u) { $script:_ResolveCache.Users[$Id] = ($u.DisplayName ?? $u.UserPrincipalName ?? $Id) }
+    }
+    if ($script:_ResolveCache.Users.ContainsKey($Id)) {
+        return @{ RawType='User'; Id=$Id; NormType='User'; Friendly=$script:_ResolveCache.Users[$Id]; AttachedType=""; AttachedName="" }
+    }
+
+    # Unknown
+    return @{ RawType=''; Id=$Id; NormType='Unknown'; Friendly=$Id; AttachedType=""; AttachedName="" }
+}
+
+function Format-TargetBracket {
+    param($Resolved)
     $humanType = Get-HumanTypeLabel -NormalizedType $Resolved.NormType
     $rawPart   = if ($Resolved.Id) { "$($Resolved.RawType) $($Resolved.Id)" } else { $Resolved.RawType }
-
     $attach = ""
     if ($Resolved.NormType -eq 'ResourceAccount' -and $Resolved.AttachedType) {
         $attachHuman = Get-HumanTypeLabel -NormalizedType $Resolved.AttachedType
-        if ($Resolved.AttachedName) {
-            # Use ${attachHuman}: to avoid parser ambiguity
-            $attach = "; attached to ${attachHuman}: $(HtmlEncode $Resolved.AttachedName)"
-        } else {
-            $attach = "; attached to ${attachHuman}"
-        }
+        if ($Resolved.AttachedName) { $attach = "; attached to ${attachHuman}: $(HtmlEncode $Resolved.AttachedName)" }
+        else { $attach = "; attached to ${attachHuman}" }
     }
-
     " <span style='color:#605E5C'>( $humanType; $(HtmlEncode $rawPart)$attach )</span>"
 }
 
-# ----------------------------- Greeting helpers -----------------------------
-function Get-CallableEntitySummary {
-    <#
-    .SYNOPSIS
-    Simple "Type : Id" HTML-encoded summary for operators etc.
-    #>
+# ---------------------- Greetings and summaries -----------------------------
+function Get-CallableEntitySummary { # (kept, but not used for Operator anymore)
     param($Entity)
     if (-not $Entity) { return "" }
-
     $t  = $Entity.Type
     $id = Get-IdFromCallTarget -CallTarget $Entity
-
     if ($t -and $id) { return "$(HtmlEncode $t) : $(HtmlEncode $id)" }
     if ($id) { return HtmlEncode $id }
-
     HtmlEncode (($Entity | Out-String).Trim())
 }
 
 function Get-PromptSummary {
-    <#
-    .SYNOPSIS
-    Returns "TTS: <text>" or "AudioFile: <name>" or "Greeting present (unparsed)".
-    #>
     param($Prompt)
-
     if (-not $Prompt) { return "No greeting" }
-
-    if ($Prompt.TextToSpeechPrompt) {
-        return "TTS: $(HtmlEncode $Prompt.TextToSpeechPrompt)"
-    }
-
+    if ($Prompt.TextToSpeechPrompt) { return "TTS: $(HtmlEncode $Prompt.TextToSpeechPrompt)" }
     if ($Prompt.AudioFilePrompt) {
         $af = $Prompt.AudioFilePrompt
-        $name = $af.FileName
-        if (-not $name) { $name = $af.Name }
-        if (-not $name) { $name = $af.Id }
-        if (-not $name) { $name = "Audio prompt (no name exposed)" }
+        $name = $af.FileName; if (-not $name) { $name = $af.Name }; if (-not $name) { $name = $af.Id }; if (-not $name) { $name = "Audio prompt (no name exposed)" }
         return "AudioFile: $(HtmlEncode $name)"
     }
-
     "Greeting present (unparsed)"
 }
 
 function Get-GreetingsSummary {
-    <#
-    .SYNOPSIS
-    Joins prompt summaries with <br/>; returns "No greeting" if none.
-    #>
     param($Greetings)
     if (-not $Greetings -or $Greetings.Count -eq 0) { return "No greeting" }
     ($Greetings | ForEach-Object { Get-PromptSummary -Prompt $_ }) -join "<br/>"
 }
 
 function Get-MenuPromptsSummary {
-    <#
-    .SYNOPSIS
-    Summarizes DefaultCallFlow.Menu.Prompts as a single line for the table.
-    .OUTPUTS
-    "Greeting: TTS: <text>" | "Greeting: AudioFile" | "Greeting: None"
-    #>
     param($Menu)
     if (-not $Menu -or -not $Menu.Prompts) { return "Greeting: None" }
-
     $p = $Menu.Prompts
     if ($p.ActiveType -eq 'TextToSpeech' -and $p.TextToSpeechPrompt) { return "Greeting: TTS: $(HtmlEncode $p.TextToSpeechPrompt)" }
-    if ($p.ActiveType -eq 'AudioFile' -and $p.AudioFilePrompt)     { return "Greeting: AudioFile" }
-
+    if ($p.ActiveType -eq 'AudioFile' -and $p.AudioFilePrompt) { return "Greeting: AudioFile" }
     if ($p.TextToSpeechPrompt) { return "Greeting: TTS: $(HtmlEncode $p.TextToSpeechPrompt)" }
     if ($p.AudioFilePrompt)   { return "Greeting: AudioFile" }
-
     "Greeting: None"
+}
+
+# Helper to build a friendly+bracket string from CallTarget with fallback resolver
+function Build-FriendlyBlockFromCallTarget {
+    param($CallTarget)
+
+    if (-not $CallTarget) { return @{ Friendly=""; Bracket=""; RawLabel="" ; Res=$null } }
+
+    $res = Resolve-CallTargetFriendly -CallTarget $CallTarget
+    $id  = Get-IdFromCallTarget -CallTarget $CallTarget
+
+    # Fallback resolution if friendly is blank or equals Id
+    if (-not $res.Friendly -or ($id -and $res.Friendly -eq $id)) {
+        $alt = Resolve-AnyIdFriendly -Id $id
+        if ($alt.Friendly) { $res = $alt }
+    }
+
+    $friendly = "$(HtmlEncode $res.Friendly)"
+    $bracket  = Format-TargetBracket -Resolved $res
+
+    $rawLabel = ""
+    if ($id) { $rawLabel = "$(HtmlEncode $CallTarget.Type) $(HtmlEncode $id)" }
+    else { $rawLabel = "$(HtmlEncode $CallTarget.Type)" }
+
+    @{ Friendly=$friendly; Bracket=$bracket; RawLabel=$rawLabel; Res=$res }
 }
 
 # ----------------------------- Call flow classification -----------------------------
 function Get-CallFlowModeSummary {
-    <#
-    .SYNOPSIS
-    Classifies a call flow as Menu / Disconnect / Redirect using 'Automatic' vs keypad options.
-    .DESCRIPTION
-    - If exactly one option with DtmfResponse='Automatic' and Action=DisconnectCall -> Disconnect
-    - If exactly one option with DtmfResponse='Automatic' and Action=TransferCallToTarget -> Redirect (shows target)
-    - If there are keypad options (Tone1..9, Star, Pound) -> Menu
-    Otherwise shows a reasonable fallback with greeting.
-    #>
     param($CallFlow)
 
     if (-not $CallFlow) { return "Not configured" }
@@ -478,35 +519,27 @@ function Get-CallFlowModeSummary {
     if ($auto.Count -eq 1 -and $keys.Count -eq 0) {
         $o = $auto[0]
         switch ($o.Action) {
-            'DisconnectCall' {
-                return "<b>Greeting:</b> $greeting<br/><b>Action:</b> Disconnect"
-            }
+            'DisconnectCall' { return "<b>Greeting:</b> $greeting<br/><b>Action:</b> Disconnect" }
             'TransferCallToTarget' {
                 if ($o.CallTarget) {
-                    $resolved = Resolve-CallTargetFriendly -CallTarget $o.CallTarget
-                    $id       = Get-IdFromCallTarget -CallTarget $o.CallTarget
-                    $friendly = "$(HtmlEncode $resolved.Friendly)"
-                    $rawLabel = if ($id) { "$(HtmlEncode $o.CallTarget.Type) $(HtmlEncode $id)" } else { "$(HtmlEncode $o.CallTarget.Type)" }
-                    $bracket  = Format-TargetBracket -Resolved $resolved
-
-                    $targetPart = if ($friendly) {
-                        if ($rawLabel -and ($rawLabel -ne $friendly)) {
-                            "<br/><b>Target:</b> $friendly <span style='color:#605E5C'>( $rawLabel )</span>$bracket"
+                    $blk = Build-FriendlyBlockFromCallTarget -CallTarget $o.CallTarget
+                    $targetPart = ""
+                    if ($blk.Friendly) {
+                        if ($blk.RawLabel -and ($blk.RawLabel -ne $blk.Friendly)) {
+                            $targetPart = "<br/><b>Target:</b> $($blk.Friendly) <span style='color:#605E5C'>( $($blk.RawLabel) )</span>$($blk.Bracket)"
                         } else {
-                            "<br/><b>Target:</b> $friendly$bracket"
+                            $targetPart = "<br/><b>Target:</b> $($blk.Friendly)$($blk.Bracket)"
                         }
-                    } elseif ($rawLabel) { "<br/><b>Target:</b> $rawLabel$bracket" } else { "" }
-
+                    } elseif ($blk.RawLabel) {
+                        $targetPart = "<br/><b>Target:</b> $($blk.RawLabel)$($blk.Bracket)"
+                    }
                     return "<b>Greeting:</b> $greeting<br/><b>Action:</b> Redirect$targetPart"
                 } else {
                     return "<b>Greeting:</b> $greeting<br/><b>Action:</b> Redirect (no target returned)"
                 }
             }
             default {
-                $label = switch -Regex ($o.Action) {
-                    "Announcement" { "Announcement" }
-                    default        { [string]$o.Action }
-                }
+                $label = switch -Regex ($o.Action) { "Announcement" { "Announcement" } default { [string]$o.Action } }
                 return "<b>Greeting:</b> $greeting<br/><b>Action:</b> $(HtmlEncode $label)"
             }
         }
@@ -516,28 +549,20 @@ function Get-CallFlowModeSummary {
         return "<b>Greeting:</b> $greeting<br/><b>Action:</b> Menu"
     }
 
-    # Fallback: multiple 'Automatic' (unusual)
+    # Fallback: multiple Automatic
     $first = $auto | Select-Object -First 1
     if ($first) {
-        $act = switch -Regex ($first.Action) {
-            "Disconnect"   { "Disconnect" }
-            "Transfer"     { "Redirect" }
-            "Announcement" { "Announcement" }
-            default        { [string]$first.Action }
-        }
+        $act = switch -Regex ($first.Action) { "Disconnect" { "Disconnect" } "Transfer" { "Redirect" } "Announcement" { "Announcement" } default { [string]$first.Action } }
         if ($act -eq 'Redirect' -and $first.CallTarget) {
-            $resolved = Resolve-CallTargetFriendly -CallTarget $first.CallTarget
-            $id       = Get-IdFromCallTarget -CallTarget $first.CallTarget
-            $friendly = "$(HtmlEncode $resolved.Friendly)"
-            $rawLabel = if ($id) { "$(HtmlEncode $first.CallTarget.Type) $(HtmlEncode $id)" } else { "$(HtmlEncode $first.CallTarget.Type)" }
-            $bracket  = Format-TargetBracket -Resolved $resolved
-            $targetPart = if ($friendly) {
-                if ($rawLabel -and ($rawLabel -ne $friendly)) {
-                    "<br/><b>Target:</b> $friendly <span style='color:#605E5C'>( $rawLabel )</span>$bracket"
+            $blk = Build-FriendlyBlockFromCallTarget -CallTarget $first.CallTarget
+            $targetPart = ""
+            if ($blk.Friendly) {
+                if ($blk.RawLabel -and ($blk.RawLabel -ne $blk.Friendly)) {
+                    $targetPart = "<br/><b>Target:</b> $($blk.Friendly) <span style='color:#605E5C'>( $($blk.RawLabel) )</span>$($blk.Bracket)"
                 } else {
-                    "<br/><b>Target:</b> $friendly$bracket"
+                    $targetPart = "<br/><b>Target:</b> $($blk.Friendly)$($blk.Bracket)"
                 }
-            } elseif ($rawLabel) { "<br/><b>Target:</b> $rawLabel$bracket" } else { "" }
+            } elseif ($blk.RawLabel) { $targetPart = "<br/><b>Target:</b> $($blk.RawLabel)$($blk.Bracket)" }
             return "<b>Greeting:</b> $greeting<br/><b>Action:</b> $act$targetPart"
         } else {
             return "<b>Greeting:</b> $greeting<br/><b>Action:</b> $act"
@@ -549,12 +574,7 @@ function Get-CallFlowModeSummary {
 
 # ----------------------------- Misc formatting helpers -----------------------------
 function Get-FixedScheduleRangesText {
-    <#
-    .SYNOPSIS
-    Formats FixedSchedule.DateTimeRanges from an AA schedule into "dd/MM/yyyy HH:mm-dd/MM/yyyy HH:mm".
-    #>
     param($Schedule)
-
     if (-not $Schedule) { return "" }
     if ($Schedule.Type -ne "Fixed") { return "" }
     if (-not $Schedule.FixedSchedule) { return "" }
@@ -563,28 +583,64 @@ function Get-FixedScheduleRangesText {
     if (-not $ranges) { return "" }
 
     $parts = @()
-
     foreach ($r in @($ranges)) {
         if ($null -eq $r) { continue }
-        $start = $r.Start
-        $end   = $r.End
-
+        $start = $r.Start; $end = $r.End
         $sTxt = if ($start -is [datetime]) { $start.ToString("dd/MM/yyyy HH:mm") } else { [string]$start }
         $eTxt = if ($end   -is [datetime]) { $end.ToString("dd/MM/yyyy HH:mm") } else { [string]$end }
-
         $parts += "$sTxt-$eTxt"
     }
-
     if ($parts.Count -eq 0) { return "" }
-
     HtmlEncode ($parts -join "; ")
 }
 
+function Get-WeeklyScheduleText {
+    param($Weekly)
+    if (-not $Weekly) { return "Schedule present (not weekly recurrent)" }
+    $days = @("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($d in $days) {
+        $prop  = "${d}Hours"
+        $hours = $Weekly.$prop
+        if ($hours -and $hours.Count -gt 0) {
+            $ranges = foreach ($h in $hours) {
+                $s = [string]$h.Start; $e = [string]$h.End
+                "$s–$e"
+            }
+            [void]$lines.Add("<b>${d}:</b> $(HtmlEncode (($ranges -join ', ')))")
+        }
+    }
+    if ($lines.Count -eq 0) { return "Not configured" }
+    ($lines -join "<br/>")
+}
+
+function Get-BusinessHoursText {
+    param(
+        [Parameter(Mandatory)] $AA,
+        [Parameter(Mandatory)] $SchedById
+    )
+
+    if (-not $AA) { return "Not configured" }
+
+    $bhAssoc = $AA.CallHandlingAssociations | Where-Object { $_.Type -eq "BusinessHours" } | Select-Object -First 1
+    if ($bhAssoc) {
+        $bhSched = $SchedById[[string]$bhAssoc.ScheduleId]
+        if ($bhSched -and $bhSched.WeeklyRecurrentSchedule) { return Get-WeeklyScheduleText -Weekly $bhSched.WeeklyRecurrentSchedule }
+        elseif ($bhSched) { return "Schedule present (not weekly recurrent)" }
+        else { return "Business-hours schedule not found in AA object" }
+    }
+
+    $weeklyCandidates = @($AA.Schedules | Where-Object { $_.WeeklyRecurrentSchedule })
+    $nameHint = $weeklyCandidates | Where-Object { $_.Name -match '(business|work|working|hours)' } | Select-Object -First 1
+    if ($nameHint) { return Get-WeeklyScheduleText -Weekly $nameHint.WeeklyRecurrentSchedule }
+
+    $firstWeekly = $weeklyCandidates | Select-Object -First 1
+    if ($firstWeekly) { return Get-WeeklyScheduleText -Weekly $firstWeekly.WeeklyRecurrentSchedule }
+
+    "Not configured"
+}
+
 function Get-HolidayLines {
-    <#
-    .SYNOPSIS
-    Renders AA holiday lines: "<Name>: <dates>, Greeting: <...>, Action: <...>, Target: <...>" (friendly + brackets).
-    #>
     param(
         [Parameter(Mandatory)] $HolidayAssocs,
         [Parameter(Mandatory)] $SchedById,
@@ -602,25 +658,16 @@ function Get-HolidayLines {
 
         $holidayName = if ($hs -and $hs.Name) { $hs.Name } else { $sid }
 
-        # Dates
-        $rangeText = ""
-        if ($hs) { $rangeText = Get-FixedScheduleRangesText -Schedule $hs }
-        if (-not $rangeText) { $rangeText = "Dates not found" }
+        $rangeText = ""; if ($hs) { $rangeText = Get-FixedScheduleRangesText -Schedule $hs }; if (-not $rangeText) { $rangeText = "Dates not found" }
 
-        # Greeting (holiday call flow)
-        $greetingText = "No greeting"
-        if ($hf) { $greetingText = Get-GreetingsSummary -Greetings $hf.Greetings }
+        $greetingText = "No greeting"; if ($hf) { $greetingText = Get-GreetingsSummary -Greetings $hf.Greetings }
 
-        # Action + Target (with enhanced brackets)
         $at = @{ Action="Unknown"; Target=""; TargetFriendly="" }
         if ($hf -and $hf.Menu) { $at = Get-ActionAndTargetFromMenu -Menu $hf.Menu }
 
         $targetPart = ""
-        if ($at.TargetFriendly) {
-            $targetPart = ", <b>Target:</b> $($at.TargetFriendly)"
-        } elseif ($at.Target) {
-            $targetPart = ", <b>Target:</b> $($at.Target)"
-        }
+        if ($at.TargetFriendly) { $targetPart = ", <b>Target:</b> $($at.TargetFriendly)" }
+        elseif ($at.Target)     { $targetPart = ", <b>Target:</b> $($at.Target)" }
 
         "<b>$(HtmlEncode $holidayName):</b> $rangeText, <b>Greeting:</b> $greetingText, <b>Action:</b> $(HtmlEncode $at.Action)$targetPart"
     }
@@ -628,12 +675,7 @@ function Get-HolidayLines {
     $lines -join "<br/>"
 }
 
-# Choose a representative target for single-line sections (Holidays, legacy one-liners)
 function Get-ActionAndTargetFromMenu {
-    <#
-    .SYNOPSIS
-    Picks a representative option from a menu, preferring Automatic transfers, and returns Action + Target labels.
-    #>
     param($Menu)
 
     if (-not $Menu -or -not $Menu.MenuOptions -or $Menu.MenuOptions.Count -eq 0) {
@@ -642,42 +684,27 @@ function Get-ActionAndTargetFromMenu {
 
     $opt =
         $Menu.MenuOptions | Where-Object { $_.DtmfResponse -eq "Automatic" -and $_.Action -match 'Transfer' -and $_.CallTarget } | Select-Object -First 1
-    if (-not $opt) {
-        $opt = $Menu.MenuOptions | Where-Object { $_.DtmfResponse -eq "Automatic" -and $_.CallTarget } | Select-Object -First 1
-    }
-    if (-not $opt) {
-        $opt = $Menu.MenuOptions | Where-Object { $_.CallTarget } | Select-Object -First 1
-    }
-    if (-not $opt) {
-        $opt = $Menu.MenuOptions | Select-Object -First 1
-    }
+    if (-not $opt) { $opt = $Menu.MenuOptions | Where-Object { $_.DtmfResponse -eq "Automatic" -and $_.CallTarget } | Select-Object -First 1 }
+    if (-not $opt) { $opt = $Menu.MenuOptions | Where-Object { $_.CallTarget } | Select-Object -First 1 }
+    if (-not $opt) { $opt = $Menu.MenuOptions | Select-Object -First 1 }
 
-    $act = $opt.Action
-    if (-not $act) { $act = "Unknown" }
+    $act = $opt.Action; if (-not $act) { $act = "Unknown" }
 
     $actionLabel = $act
-    switch -Regex ($act) {
-        "Disconnect"   { $actionLabel = "Disconnect" }
-        "Transfer"     { $actionLabel = "Forward/Transfer" }
-        "Announcement" { $actionLabel = "Announcement" }
-    }
+    switch -Regex ($act) { "Disconnect" { $actionLabel = "Disconnect" }; "Transfer" { $actionLabel = "Forward/Transfer" }; "Announcement" { $actionLabel = "Announcement" } }
 
-    $targetLabel    = ""
-    $targetFriendly = ""
+    $blk = $null
+    if ($opt.CallTarget) { $blk = Build-FriendlyBlockFromCallTarget -CallTarget $opt.CallTarget }
 
-    if ($opt.CallTarget) {
-        $resolved = Resolve-CallTargetFriendly -CallTarget $opt.CallTarget
-        $id       = Get-IdFromCallTarget -CallTarget $opt.CallTarget
+    $targetLabel = ""; $targetFriendly = ""
+    if ($blk) {
+        $targetFriendly = $blk.Friendly
+        $targetLabel = if ($blk.RawLabel) { $blk.RawLabel } else { "" }
 
-        $targetFriendly = "$(HtmlEncode $resolved.Friendly)"
-        $targetLabel    = if ($id) { "$(HtmlEncode $opt.CallTarget.Type) $(HtmlEncode $id)" } else { "$(HtmlEncode $opt.CallTarget.Type)" }
-
-        # Append the bracket info right after friendly/raw (human type, raw Type/Id, RA attachment if any)
-        $bracket = Format-TargetBracket -Resolved $resolved
         if ($targetFriendly) {
-            $targetFriendly = "$targetFriendly$bracket"
+            $targetFriendly = "$targetFriendly$($blk.Bracket)"
         } elseif ($targetLabel) {
-            $targetLabel = "$targetLabel$bracket"
+            $targetLabel = "$targetLabel$($blk.Bracket)"
         }
     }
 
@@ -685,10 +712,6 @@ function Get-ActionAndTargetFromMenu {
 }
 
 function Get-DefaultCallFlowCleanSummary {
-    <#
-    .SYNOPSIS
-    Legacy one-liner for call flow greeting + representative action/target (still used in some sections).
-    #>
     param($CallFlow)
     if (-not $CallFlow) { return "Not configured" }
 
@@ -696,41 +719,22 @@ function Get-DefaultCallFlowCleanSummary {
     $at = Get-ActionAndTargetFromMenu -Menu $CallFlow.Menu
 
     $targetPart = ""
-    if ($at.TargetFriendly) {
-        $targetPart = "<br/><b>Target:</b> $($at.TargetFriendly)"
-    } elseif ($at.Target) {
-        $targetPart = "<br/><b>Target:</b> $($at.Target)"
-    }
+    if ($at.TargetFriendly) { $targetPart = "<br/><b>Target:</b> $($at.TargetFriendly)" }
+    elseif ($at.Target)     { $targetPart = "<br/><b>Target:</b> $($at.Target)" }
 
     "<b>Greeting:</b> $greeting<br/><b>Action:</b> $(HtmlEncode $at.Action)$targetPart"
 }
 
-# ----------------------------- Default menu options (no per-option greeting) -----------------------------
 function Get-DefaultMenuOptionsLines {
-    <#
-    .SYNOPSIS
-    Renders all default call flow options as "Option X: Action: <...>, Target: <...>" (no per-option greeting).
-    #>
     param($Menu)
 
     if (-not $Menu -or -not $Menu.MenuOptions -or $Menu.MenuOptions.Count -eq 0) { return "No options configured" }
 
     function Get-DtmfLabel([string]$d) {
         switch ($d) {
-            "Tone0" { "0" }
-            "Tone1" { "1" }
-            "Tone2" { "2" }
-            "Tone3" { "3" }
-            "Tone4" { "4" }
-            "Tone5" { "5" }
-            "Tone6" { "6" }
-            "Tone7" { "7" }
-            "Tone8" { "8" }
-            "Tone9" { "9" }
-            "Star"  { "*" }
-            "Pound" { "#" }
-            "Automatic" { "Auto" }
-            default { $d }
+            "Tone0" { "0" } "Tone1" { "1" } "Tone2" { "2" } "Tone3" { "3" } "Tone4" { "4" }
+            "Tone5" { "5" } "Tone6" { "6" } "Tone7" { "7" } "Tone8" { "8" } "Tone9" { "9" }
+            "Star"  { "*" } "Pound" { "#" } "Automatic" { "Auto" } default { $d }
         }
     }
 
@@ -739,54 +743,32 @@ function Get-DefaultMenuOptionsLines {
         $act  = if ($opt.Action) { [string]$opt.Action } else { "Unknown" }
 
         $actionLabel = $act
-        switch -Regex ($act) {
-            "Disconnect"   { $actionLabel = "Disconnect" }
-            "Transfer"     { $actionLabel = "Forward/Transfer" }
-            "Announcement" { $actionLabel = "Announcement" }
-        }
+        switch -Regex ($act) { "Disconnect" { $actionLabel = "Disconnect" } "Transfer" { $actionLabel = "Forward/Transfer" } "Announcement" { $actionLabel = "Announcement" } }
 
-        $targetLabel    = ""
-        $targetFriendly = ""
-        if ($opt.CallTarget) {
-            $resolved = Resolve-CallTargetFriendly -CallTarget $opt.CallTarget
-            $id       = Get-IdFromCallTarget -CallTarget $opt.CallTarget
-
-            $targetFriendly = "$(HtmlEncode $resolved.Friendly)"
-            $targetLabel    = if ($id) { "$(HtmlEncode $opt.CallTarget.Type) $(HtmlEncode $id)" } else { "$(HtmlEncode $opt.CallTarget.Type)" }
-
-            # Add bracket detail after the friendly/raw
-            $bracket = Format-TargetBracket -Resolved $resolved
-            if ($targetFriendly) {
-                $targetFriendly = "$targetFriendly$bracket"
-            } elseif ($targetLabel) {
-                $targetLabel = "$targetLabel$bracket"
-            }
+        $blk = $null; if ($opt.CallTarget) { $blk = Build-FriendlyBlockFromCallTarget -CallTarget $opt.CallTarget }
+        $targetLabel = ""; $targetFriendly = ""
+        if ($blk) {
+            $targetFriendly = $blk.Friendly
+            $targetLabel    = if ($blk.RawLabel) { $blk.RawLabel } else { "" }
+            if ($targetFriendly) { $targetFriendly = "$targetFriendly$($blk.Bracket)" }
+            elseif ($targetLabel) { $targetLabel = "$targetLabel$($blk.Bracket)" }
         }
 
         $targetPart = ""
         if ($targetFriendly) {
             if ($targetLabel -and ($targetLabel -ne $targetFriendly)) {
                 $targetPart = ", <b>Target:</b> $targetFriendly <span style='color:#605E5C'>( $targetLabel )</span>"
-            } else {
-                $targetPart = ", <b>Target:</b> $targetFriendly"
-            }
-        } elseif ($targetLabel) {
-            $targetPart = ", <b>Target:</b> $targetLabel"
-        }
+            } else { $targetPart = ", <b>Target:</b> $targetFriendly" }
+        } elseif ($targetLabel) { $targetPart = ", <b>Target:</b> $targetLabel" }
 
-        # Use ${dtmf} because it's followed by a colon
         "<b>Option ${dtmf}:</b> <b>Action:</b> $(HtmlEncode $actionLabel)$targetPart"
     }
 
     $lines -join "<br/>"
 }
 
-# ----------------------------- Authorized users helper -----------------------------
+# ----------------------------- Authorized users helper (DisplayName-first) -----------------------------
 function Resolve-AuthorizedUsers {
-    <#
-    .SYNOPSIS
-    Resolves authorized user object IDs into recognizable strings (UPN / SIP / DisplayName).
-    #>
     param([string[]]$ObjectIds, [hashtable]$Cache)
 
     if (-not $ObjectIds -or $ObjectIds.Count -eq 0) { return @() }
@@ -799,14 +781,21 @@ function Resolve-AuthorizedUsers {
         $label = $null
         try {
             $u = Get-CsOnlineUser -Identity $idStr -ErrorAction Stop
-            $label = ($u.UserPrincipalName ?? $u.SipAddress ?? $u.DisplayName ?? $idStr)
+            if ($u) {
+                if ($u.DisplayName)       { $label = $u.DisplayName }
+                elseif ($u.UserPrincipalName) { $label = $u.UserPrincipalName }
+                elseif ($u.SipAddress)    { $label = $u.SipAddress }
+            }
         } catch {
             try {
                 if (Get-Command Get-MgUser -ErrorAction SilentlyContinue) {
                     $g = Get-MgUser -UserId $idStr -Property DisplayName,UserPrincipalName -ErrorAction Stop
-                    $label = ($g.UserPrincipalName ?? $g.DisplayName ?? $idStr)
+                    if ($g) {
+                        if     ($g.DisplayName)       { $label = $g.DisplayName }
+                        elseif ($g.UserPrincipalName) { $label = $g.UserPrincipalName }
+                    }
                 }
-            } catch { $label = $idStr }
+            } catch { }
         }
 
         if (-not $label) { $label = $idStr }
@@ -817,10 +806,6 @@ function Resolve-AuthorizedUsers {
 
 # ----------------------------- HTML table builder -----------------------------
 function New-ParamValueTableHtml {
-    <#
-    .SYNOPSIS
-    Builds a <table> with "Parameter" / "Value" columns for a given section title.
-    #>
     param(
         [Parameter(Mandatory)][string]$Title,
         [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Rows
@@ -834,7 +819,7 @@ function New-ParamValueTableHtml {
 
     foreach ($r in $Rows) {
         $p = HtmlEncode ([string]$r.Parameter)
-        $v = [string]$r.Value   # Value may contain <br/>/<b> etc intentionally
+        $v = [string]$r.Value
         [void]$sb.AppendLine("<tr><td>$p</td><td>$v</td></tr>")
     }
 
@@ -874,47 +859,45 @@ try {
         $rows.Add([pscustomobject]@{ Parameter="Time zone"; Value=HtmlEncode $aa.TimeZoneId })
         $rows.Add([pscustomobject]@{ Parameter="Language"; Value=HtmlEncode $aa.LanguageId })
         $rows.Add([pscustomobject]@{ Parameter="Voice input (EnableVoiceResponse)"; Value=($(if ($aa.VoiceResponseEnabled) { "Yes" } else { "No" })) })
-        $rows.Add([pscustomobject]@{ Parameter="Voice / TTS voice"; Value=HtmlEncode ($aa.VoiceId ?? "") })
-        $rows.Add([pscustomobject]@{ Parameter="Operator"; Value=(Get-CallableEntitySummary $aa.Operator) })
+
+        $voiceIdVal = ""; if ($aa.VoiceId) { $voiceIdVal = $aa.VoiceId }
+        $rows.Add([pscustomobject]@{ Parameter="Voice / TTS voice"; Value=HtmlEncode $voiceIdVal })
+
+        # ---- Operator (friendly + brackets) ----
+        $opVal = "None"
+        if ($aa.Operator) {
+            $blk = Build-FriendlyBlockFromCallTarget -CallTarget $aa.Operator
+            if ($blk.Friendly)     { $opVal = "$($blk.Friendly)$($blk.Bracket)" }
+            elseif ($blk.RawLabel) { $opVal = "$($blk.RawLabel)$($blk.Bracket)" }
+        }
+        $rows.Add([pscustomobject]@{ Parameter="Operator"; Value=$opVal })
 
         # ---- Business hours schedule (text) ----
         $rows.Add([pscustomobject]@{ Parameter="Business hours"; Value=(Get-BusinessHoursText -AA $aa -SchedById $schedById) })
 
         # ---- Business hours call handling (Menu / Disconnect / Redirect) ----
-        $rows.Add([pscustomobject]@{
-            Parameter = "Business hours call handling"
-            Value     = (Get-CallFlowModeSummary -CallFlow $aa.DefaultCallFlow)
-        })
+        $rows.Add([pscustomobject]@{ Parameter = "Business hours call handling"; Value = (Get-CallFlowModeSummary -CallFlow $aa.DefaultCallFlow) })
 
-        # ---- Default menu greeting (from DefaultCallFlow.Menu.Prompts) ----
+        # ---- Default menu greeting ----
         if ($aa.DefaultCallFlow -and $aa.DefaultCallFlow.Menu) {
-            $rows.Add([pscustomobject]@{
-                Parameter = "Default menu greeting"
-                Value     = (Get-MenuPromptsSummary -Menu $aa.DefaultCallFlow.Menu)
-            })
+            $rows.Add([pscustomobject]@{ Parameter = "Default menu greeting"; Value = (Get-MenuPromptsSummary -Menu $aa.DefaultCallFlow.Menu) })
         } else {
             $rows.Add([pscustomobject]@{ Parameter="Default menu greeting"; Value="Greeting: None" })
         }
 
-        # ---- Default call flow options (DTMF + Action + Target; NO per-option greeting) ----
+        # ---- Default call flow options ----
         if ($aa.DefaultCallFlow -and $aa.DefaultCallFlow.Menu) {
-            $rows.Add([pscustomobject]@{
-                Parameter = "Default call flow options"
-                Value     = (Get-DefaultMenuOptionsLines -Menu $aa.DefaultCallFlow.Menu)
-            })
+            $rows.Add([pscustomobject]@{ Parameter = "Default call flow options"; Value = (Get-DefaultMenuOptionsLines -Menu $aa.DefaultCallFlow.Menu) })
         } else {
             $rows.Add([pscustomobject]@{ Parameter="Default call flow options"; Value="No options configured" })
         }
 
-        # ---- After-hours call handling (classified; mirrors business hours logic) ----
+        # ---- After-hours call handling (classified) ----
         $afterAssoc = @($aa.CallHandlingAssociations | Where-Object { $_.Type -eq "AfterHours" } | Select-Object -First 1)
         if ($afterAssoc) {
             $afterFlow = $cfById[[string]$afterAssoc.CallFlowId]
             if ($afterFlow) {
-                $rows.Add([pscustomobject]@{
-                    Parameter = "After-hours call handling"
-                    Value     = (Get-CallFlowModeSummary -CallFlow $afterFlow)
-                })
+                $rows.Add([pscustomobject]@{ Parameter = "After-hours call handling"; Value = (Get-CallFlowModeSummary -CallFlow $afterFlow) })
             } else {
                 $rows.Add([pscustomobject]@{ Parameter="After-hours call handling"; Value="After-hours call flow not found in AA object" })
             }
@@ -942,7 +925,7 @@ try {
         }
         $rows.Add([pscustomobject]@{ Parameter="Resource accounts / numbers"; Value=($(if ($raLines.Count) { $raLines -join "<br/>" } else { "None / not returned by API" })) })
 
-        # ---- Authorized users ----
+        # ---- Authorized users (DisplayName-first) ----
         $authIds = @($aa.AuthorizedUsers)
         $authNames = Resolve-AuthorizedUsers -ObjectIds $authIds -Cache $authUserCache
         $rows.Add([pscustomobject]@{ Parameter="Authorized users"; Value=($(if ($authNames.Count) { ($authNames | ForEach-Object { HtmlEncode $_ }) -join "<br/>" } else { "None" })) })
@@ -962,7 +945,7 @@ table {
     border-collapse: collapse; 
     width: 100%; 
     font-size: 12px;
-    table-layout: auto;   /* allow dynamic sizing */
+    table-layout: auto;
 }
 
 th, td { 
@@ -978,17 +961,8 @@ th {
     font-weight: 600;
 }
 
-/* Make left column narrower */
-td:first-child, th:first-child {
-    width: 220px;           /* adjust to taste (180–250px works well) */
-    white-space: nowrap;    /* prevents wrapping of parameter names */
-}
-
-/* Let right column expand */
-td:last-child, th:last-child {
-    width: auto;
-}
-
+td:first-child, th:first-child { width: 220px; white-space: nowrap; }
+td:last-child, th:last-child   { width: auto; }
 tr:nth-child(even) { background: #fafafa; }
 </style>
 "@
