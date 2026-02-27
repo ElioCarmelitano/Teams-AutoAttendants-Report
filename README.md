@@ -1,3 +1,5 @@
+Connect to Teams and ExchangeOnline PowerShell Modules before running.
+
 # Teams-AutoAttendants-Report
 .SYNOPSIS
 Generates an HTML documentation report for all Microsoft Teams Auto Attendants in the tenant.
