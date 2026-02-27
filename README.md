@@ -1,61 +1,74 @@
 Connect to Teams and ExchangeOnline PowerShell Modules before running.
 
-# Teams-AutoAttendants-Report
+# Document-TeamsAutoAttendants
 .SYNOPSIS
-Generates an HTML documentation report for all Microsoft Teams Auto Attendants in the tenant.
+Generates an HTML documentation report for all Microsoft Teams Auto Attendants.
 
 .DESCRIPTION
-This script enumerates all Auto Attendants (AAs) and produces a formatted HTML report that documents:
- - General AA settings (name, ID, time zone, language, voice input, operator).
- - Business hours schedule text.
+Read-only documentation script that enumerates all Microsoft Teams Auto Attendants (AAs) and produces
+a structured HTML report. The report includes resolved (friendly) names for common targets/agents where
+possible, plus audit-friendly bracket details (raw types/IDs and Resource Account attachments).
+
+The report includes:
+ - Identity & basics (Name, Identity, Time zone, Language, Voice input, Voice/TTS voice, Operator)
+ - Business hours (weekly schedule text)
  - Business hours call handling classified as Menu / Disconnect / Redirect using the 'Automatic' rule:
-     * If there is one MenuOption with DtmfResponse = 'Automatic' and Action = DisconnectCall -> Disconnect
-     * If there is one MenuOption with DtmfResponse = 'Automatic' and Action = TransferCallToTarget -> Redirect (shows friendly target)
-     * If there are keypad options (Tone1..9, Star, Pound) -> Menu
- - Default menu greeting (from DefaultCallFlow.Menu.Prompts) shown as:
+     * Single MenuOption with DtmfResponse='Automatic' + Action=DisconnectCall -> Disconnect
+     * Single MenuOption with DtmfResponse='Automatic' + Action=TransferCallToTarget -> Redirect (shows target)
+     * Any keypad options (Tone1..9, Star, Pound) -> Menu
+ - Default menu greeting (from DefaultCallFlow.Menu.Prompts):
      * "Greeting: TTS: <text>" OR "Greeting: AudioFile" OR "Greeting: None"
- - Default call flow options (DTMF + Action + Target) for all keys 0–9/*/# (no per-option greeting).
- - After-hours call handling classified with the same logic (Menu / Disconnect / Redirect).
- - Holidays (date ranges, greeting, action, target).
- - Resource accounts and numbers bound to the AA.
- - Authorized users.
+ - Default call flow options (DTMF + Action + Target) for all keys 0–9/*/# (no per-option greeting)
+ - After-hours call handling classified with the same logic (Menu / Disconnect / Redirect)
+ - Holidays (date ranges, greeting, action, target)
+ - Resource accounts and numbers bound to the AA
+ - Authorized users (friendly DisplayName where possible)
 
-Targets are resolved into friendly names with audit-friendly brackets:
- - Call Queue / Auto Attendant / Group (Shared Voicemail) / User / PSTN / Resource Account (ApplicationEndpoint).
- - Resource Accounts are mapped to the Call Queue / Auto Attendant they’re attached to (when possible) and
-   rendered with "attached to call queue/auto attendant: <Name>" for clarity.
+TARGET RESOLUTION (best effort)
+ - PSTN: strips 'tel:' and displays E.164 where possible
+ - Call Queue: CQ name by Id (handles ConfigurationEndpoint)
+ - Auto Attendant: AA name by Id
+ - Resource Account (ApplicationInstance): RA display name and, if mapped, attached CQ/AA name
+ - Group (Shared Voicemail / Team / Channel): Team/M365 Group display name where possible
+ - User: DisplayName (falls back to UPN/Id)
+ - Otherwise: shows the raw Id as “Unknown”
 
-REQUIREMENTS
- - Teams PowerShell (Teams/Skype for Business Online) module with access to:
+REQUIREMENTS / PREREQUISITES
+ - Teams/Skype Online PowerShell session with permissions to call:
      * Get-CsAutoAttendant
-     * Get-CsCallQueue
-     * Get-CsOnlineApplicationInstance
-     * Get-CsOnlineUser
- - Optional (for better SharedVoicemail group names):
+     * Get-CsCallQueue (for target resolution)
+     * Get-CsOnlineApplicationInstance (resource accounts)
+     * Get-CsOnlineUser (authorized users)
+ - Optional modules/commands (used opportunistically if available to enrich group display names):
      * MicrosoftTeams: Get-Team
      * ExchangeOnlineManagement: Get-UnifiedGroup
      * Microsoft.Graph: Get-MgGroup
-   The script will use these if present, otherwise it gracefully falls back.
+
+.OUTPUTS
+Writes an HTML report to disk. The script emits a single success message with the output path,
+and optionally opens the report in the default browser.
 
 .PARAMETER OutputPath
-Full path (or relative path) to the HTML file that will be created.
-Default: ".\Teams-AutoAttendants-Report-<timestamp>.html"
+Full or relative path to the HTML report file.
+Default: .\Document-TeamsAutoAttendants-<timestamp>.html
 
 .PARAMETER Open
-If specified, opens the generated HTML report in the default browser/viewer when complete.
+If specified, opens the generated HTML report when complete.
 
 .PARAMETER IncludeAfterHoursOptions
-(Reserved for future use) Would list after-hours menu options similar to default call flow options.
-Currently unused; included as a placeholder for easy extension.
+Reserved for future use. Intended to list after-hours menu options similar to the default call flow.
+Currently unused; retained as a placeholder for easy extension.
 
 .EXAMPLE
-PS> .\Export-TeamsAAReport.ps1
-Generates ".\Teams-AutoAttendants-Report-YYYYMMDD-HHmmss.html" and opens it if -Open is specified.
+PS> .\Document-TeamsAutoAttendants.ps1
+Generates ".\Document-TeamsAutoAttendants-YYYYMMDD-HHmmss.html".
 
 .EXAMPLE
-PS> .\Export-TeamsAAReport.ps1 -OutputPath "C:\Temp\AA-Report.html" -Open
-Writes the report to C:\Temp\AA-Report.html and opens it.
+PS> .\Document-TeamsAutoAttendants.ps1 -OutputPath "C:\Temp\AA-Report.html" -Open
+Writes the report to C:\Temp\AA-Report.html and opens it in the default browser.
 
 .NOTES
-- If you see parser errors like "variable followed by colon": use ${variable}: inside double-quoted strings.
-- This script is read-only; it does not change any tenant configuration.
+ - Parser-safety: Hashtables use ';' between key/value pairs. Complex values are built in variables first.
+ - Null-safety: .ContainsKey / indexing operations guard against null/empty keys where applicable.
+ - This script is read-only; it does not modify any tenant configuration.
+ - If optional modules (Teams/EXO/Graph) are not installed or not connected, group resolution will fall back to IDs.
